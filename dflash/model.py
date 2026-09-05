@@ -18,6 +18,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 
+from . import student_block
+
 # ---------------------------------------------------------------------------
 # Model utilities
 # ---------------------------------------------------------------------------
@@ -145,12 +147,17 @@ def _output_head(target: nn.Module) -> nn.Module:
 
 def _make_cache(config):
     cache = DynamicCache(config=config)
-    cache.activate_past_recording()
+    if hasattr(cache, "activate_past_recording"):
+        cache.activate_past_recording()
     return cache
 
 
 def _crop_to(cache, length):
     remove = cache.get_seq_length() - length
+    # Older Transformers interprets crop(0) as clearing the entire cache.
+    # Keep the modern call, which also finalizes recorded fixed-size states.
+    if remove == 0 and not hasattr(cache, "activate_past_recording"):
+        return
     cache.crop(-remove)
 
 
@@ -240,32 +247,50 @@ def dflash_generate(
                 block_output_ids,
                 float(_draft_value(model.config, "input_embedding_scale", 1.0)),
             )
-            draft_hidden = model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, start - target_hidden.shape[1] : start + verify_size],
-                past_key_values=past_key_values_draft,
-                use_cache=True,
-            )[:, 1 - verify_size :, :]
-            _crop_to(past_key_values_draft, start)
-            if isinstance(model, DFlash2DraftModel):
-                draft_tokens, draft_indices, draft_probs = model.propose(
-                    draft_hidden,
-                    block_output_ids[:, 0],
-                    _output_head(target),
-                    temperature,
+            draft_position_ids = position_ids[:, start - target_hidden.shape[1] : start + verify_size]
+            if (
+                isinstance(model, DFlashDraftModel)
+                and not isinstance(model, DFlash2DraftModel)
+                and temperature <= 0
+            ):
+                draft_tokens = student_block.parallel_block_draft(
+                    model=model,
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    draft_position_ids=draft_position_ids,
+                    past_key_values_draft=past_key_values_draft,
+                    output_head=_output_head(target),
+                    verify_size=verify_size,
                 )
+                _crop_to(past_key_values_draft, start)
                 block_output_ids[:, 1:] = draft_tokens
             else:
-                draft_logits = model.compute_logits(draft_hidden, _output_head(target))
-                if temperature > 0:
-                    draft_probs = _sampling_probs(
-                        draft_logits, temperature, top_p, top_k
+                draft_hidden = model(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=draft_position_ids,
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                )[:, 1 - verify_size :, :]
+                _crop_to(past_key_values_draft, start)
+                if isinstance(model, DFlash2DraftModel):
+                    draft_tokens, draft_indices, draft_probs = model.propose(
+                        draft_hidden,
+                        block_output_ids[:, 0],
+                        _output_head(target),
+                        temperature,
                     )
-                    block_output_ids[:, 1:] = _sample_probs(draft_probs)
-                    draft_indices = None
+                    block_output_ids[:, 1:] = draft_tokens
                 else:
-                    block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
+                    draft_logits = model.compute_logits(draft_hidden, _output_head(target))
+                    if temperature > 0:
+                        draft_probs = _sampling_probs(
+                            draft_logits, temperature, top_p, top_k
+                        )
+                        block_output_ids[:, 1:] = _sample_probs(draft_probs)
+                        draft_indices = None
+                    else:
+                        block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
